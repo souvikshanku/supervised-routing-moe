@@ -1,10 +1,6 @@
-# Copyright (c) Sebastian Raschka under Apache License 2.0 (see LICENSE.txt).
-# Source for "Build a Large Language Model From Scratch"
-# https://github.com/rasbt/LLMs-from-scratch/blob/main/ch05/07_gpt_to_llama/standalone-llama32.ipynb
-
-
 import torch
 import torch.nn as nn
+import math
 
 
 LLAMA32_CONFIG_3B = {
@@ -32,14 +28,14 @@ class Llama3Model(nn.Module):
         super().__init__()
 
         # Main model parameters
-        self.tok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
+        self.embed_tokens = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
 
-        self.trf_blocks = nn.ModuleList(  # ModuleList since Sequential can only accept one input, and we need `x, mask, cos, sin`
+        self.layers = nn.ModuleList(  # ModuleList since Sequential can only accept one input, and we need `x, mask, cos, sin`
             [TransformerBlock(cfg) for _ in range(cfg["n_layers"])]
         )
 
-        self.final_norm = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
-        self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=cfg["dtype"])
+        self.norm = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
+        self.lm_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=cfg["dtype"])
 
         # Reusuable utilities
         cos, sin = compute_rope_params(
@@ -53,45 +49,45 @@ class Llama3Model(nn.Module):
         self.cfg = cfg
 
     def forward(self, in_idx):
-        tok_embeds = self.tok_emb(in_idx)
+        tok_embeds = self.embed_tokens(in_idx)
         x = tok_embeds
 
         num_tokens = x.shape[1]
         mask = torch.triu(torch.ones(num_tokens, num_tokens, device=x.device, dtype=torch.bool), diagonal=1)
 
-        for block in self.trf_blocks:
+        for block in self.layers:
             x = block(x, mask, self.cos, self.sin)
-        x = self.final_norm(x)
-        logits = self.out_head(x.to(self.cfg["dtype"]))
+        x = self.norm(x)
+        logits = self.lm_head(x.to(self.cfg["dtype"]))
         return logits
 
 
 class TransformerBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        self.att = GroupedQueryAttention(
+        self.self_attn = GroupedQueryAttention(
             d_in=cfg["emb_dim"],
             d_out=cfg["emb_dim"],
             num_heads=cfg["n_heads"],
             num_kv_groups=cfg["n_kv_groups"],
             dtype=cfg["dtype"]
         )
-        # self.ff = FeedForward(cfg)
+        # self.mlp = FeedForward(cfg)
         self.moe = MoE(cfg)
-        self.norm1 = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
-        self.norm2 = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
+        self.input_layernorm = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
+        self.post_attention_layernorm = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
 
     def forward(self, x, mask, cos, sin):
         # Shortcut connection for attention block
         shortcut = x
-        x = self.norm1(x)
-        x = self.att(x, mask, cos, sin)  # Shape [batch_size, num_tokens, emb_size]
+        x = self.input_layernorm(x)
+        x = self.self_attn(x, mask, cos, sin)  # Shape [batch_size, num_tokens, emb_size]
         x = x + shortcut  # Add the original input back
 
         # Shortcut connection for feed-forward block
         shortcut = x
-        x = self.norm2(x)
-        # x = self.ff(x)
+        x = self.post_attention_layernorm(x)
+        # x = self.mlp(x)
         x = self.moe(x)
         x = x + shortcut  # Add the original input back
 
@@ -129,18 +125,19 @@ class MoE(nn.Module):
         out = (outs * r.unsqueeze(-2)).sum(dim=-1)
         return out
 
-# class FeedForward(nn.Module):
-#     def __init__(self, cfg):
-#         super().__init__()
-#         self.fc1 = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
-#         self.fc2 = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
-#         self.fc3 = nn.Linear(cfg["hidden_dim"], cfg["emb_dim"], dtype=cfg["dtype"], bias=False)
 
-#     def forward(self, x):
-#         x_fc1 = self.fc1(x)
-#         x_fc2 = self.fc2(x)
-#         x = nn.functional.silu(x_fc1) * x_fc2
-#         return self.fc3(x)
+class FeedForward(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.gate_proj = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
+        self.up_proj = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"], dtype=cfg["dtype"], bias=False)
+        self.down_proj = nn.Linear(cfg["hidden_dim"], cfg["emb_dim"], dtype=cfg["dtype"], bias=False)
+
+    def forward(self, x):
+        x_gate = self.gate_proj(x)
+        x_up = self.up_proj(x)
+        x = nn.functional.silu(x_gate) * x_up
+        return self.down_proj(x)
 
 
 class GroupedQueryAttention(nn.Module):
@@ -155,20 +152,20 @@ class GroupedQueryAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = d_out // num_heads
 
-        self.W_key = nn.Linear(d_in, num_kv_groups * self.head_dim, bias=False, dtype=dtype)
-        self.W_value = nn.Linear(d_in, num_kv_groups * self.head_dim, bias=False, dtype=dtype)
+        self.k_proj = nn.Linear(d_in, num_kv_groups * self.head_dim, bias=False, dtype=dtype)
+        self.v_proj = nn.Linear(d_in, num_kv_groups * self.head_dim, bias=False, dtype=dtype)
         self.num_kv_groups = num_kv_groups
         self.group_size = num_heads // num_kv_groups
 
-        self.W_query = nn.Linear(d_in, d_out, bias=False, dtype=dtype)
-        self.out_proj = nn.Linear(d_out, d_out, bias=False, dtype=dtype)
+        self.q_proj = nn.Linear(d_in, d_out, bias=False, dtype=dtype)
+        self.o_proj = nn.Linear(d_out, d_out, bias=False, dtype=dtype)
 
     def forward(self, x, mask, cos, sin):
         b, num_tokens, d_in = x.shape
 
-        queries = self.W_query(x)  # Shape: (b, num_tokens, d_out)
-        keys = self.W_key(x)  # Shape: (b, num_tokens, num_kv_groups * head_dim)
-        values = self.W_value(x)  # Shape: (b, num_tokens, num_kv_groups * head_dim)
+        queries = self.q_proj(x)  # Shape: (b, num_tokens, d_out)
+        keys = self.k_proj(x)  # Shape: (b, num_tokens, num_kv_groups * head_dim)
+        values = self.v_proj(x)  # Shape: (b, num_tokens, num_kv_groups * head_dim)
 
         # Reshape queries, keys, and values
         queries = queries.view(b, num_tokens, self.num_heads, self.head_dim)
@@ -210,10 +207,9 @@ class GroupedQueryAttention(nn.Module):
 
         # Combine heads, where self.d_out = self.num_heads * self.head_dim
         context_vec = context_vec.reshape(b, num_tokens, self.d_out)
-        context_vec = self.out_proj(context_vec)  # optional projection
+        context_vec = self.o_proj(context_vec)  # optional projection
 
         return context_vec
-
 
 def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, freq_config=None, dtype=torch.float32):
     assert head_dim % 2 == 0, "Embedding dimension must be even"
@@ -329,3 +325,70 @@ def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=No
         idx = torch.cat((idx, idx_next), dim=1)  # (batch_size, num_tokens+1)
 
     return idx
+
+from safetensors.torch import load_file
+import os
+import glob
+
+safetensors_path = "/home/jovyan/z_acl/.latent/llama3_3b_local"
+if os.path.isdir(safetensors_path):
+    safetensor_files = glob.glob(os.path.join(safetensors_path, "*.safetensors"))
+    hf_state_dict = {}
+    for f in safetensor_files:
+        hf_state_dict.update(load_file(f))
+else:
+    hf_state_dict = load_file(safetensors_path)
+
+new_state_dict = {}
+for k, v in hf_state_dict.items():
+    if k.startswith("model."):
+        new_state_dict[k[6:]] = v  # Remove 'model.' prefix
+    else:
+        new_state_dict[k] = v
+
+# Copy embed_tokens weight to lm_head
+new_state_dict["lm_head.weight"] = new_state_dict["embed_tokens.weight"]
+
+cfg = LLAMA32_CONFIG_3B
+
+for l in range(cfg['n_layers']):
+    router_weight = torch.empty(cfg['n_experts'], cfg['emb_dim'], dtype=cfg['dtype'])
+    nn.init.kaiming_uniform_(router_weight, a=math.sqrt(5))
+    new_state_dict[f"layers.{l}.moe.router.weight"] = router_weight
+
+    for e in range(cfg['n_experts']):
+        new_state_dict[f"layers.{l}.moe.experts.{e}.fc1.weight"] = hf_state_dict[f"model.layers.{l}.mlp.gate_proj.weight"]
+        new_state_dict[f"layers.{l}.moe.experts.{e}.fc2.weight"] = hf_state_dict[f"model.layers.{l}.mlp.up_proj.weight"]
+        new_state_dict[f"layers.{l}.moe.experts.{e}.fc3.weight"] = hf_state_dict[f"model.layers.{l}.mlp.down_proj.weight"]
+
+    del (
+        new_state_dict[f"layers.{l}.mlp.gate_proj.weight"],
+        new_state_dict[f"layers.{l}.mlp.up_proj.weight"],
+        new_state_dict[f"layers.{l}.mlp.down_proj.weight"]
+    )
+
+
+model = Llama3Model(LLAMA32_CONFIG_3B)
+model.load_state_dict(new_state_dict)
+
+from transformers import AutoTokenizer
+model_dir = "/home/jovyan/z_acl/.latent/llama3_3b_local"
+tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+
+MAX_NEW_TOKENS = 150
+TEMPERATURE = 0.
+TOP_K = 1
+
+PROMPT = 'What do llamas eat?'
+token_ids = generate(
+    model=model.to("cuda"),
+    idx=text_to_token_ids(PROMPT, tokenizer).to("cuda"),
+    max_new_tokens=MAX_NEW_TOKENS,
+    context_size=LLAMA32_CONFIG_3B["context_length"],
+    top_k=TOP_K,
+    temperature=TEMPERATURE
+)
+
+output_text = token_ids_to_text(token_ids, tokenizer)
+
+print("\n\nOutput text:\n\n", output_text)
