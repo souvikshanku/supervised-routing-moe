@@ -1,4 +1,3 @@
-
 import os
 
 import glob
@@ -6,8 +5,32 @@ from safetensors.torch import load_file
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 import math
+import gc
 
+gc.collect()
+torch.cuda.empty_cache()
+
+
+LLAMA32_CONFIG_1B = {
+    "vocab_size": 128_256,           # Vocabulary size
+    "context_length": 131_072,       # Context length that was used to train the model
+    "emb_dim": 2048,                 # Embedding dimension
+    "n_heads": 32,                   # Number of attention heads
+    "n_layers": 16,                  # Number of layers
+    "hidden_dim": 8192,              # Size of the intermediate dimension in FeedForward
+    "n_kv_groups": 8,                # Key-Value groups for grouped-query attention
+    "rope_base": 500_000.0,          # The base in RoPE's "theta"
+    "dtype": torch.bfloat16,         # Lower-precision dtype to reduce memory usage
+    "rope_freq": {                   # RoPE frequency scaling
+        "factor": 32.0,
+        "low_freq_factor": 1.0,
+        "high_freq_factor": 4.0,
+        "original_context_length": 8192,
+    },
+    "n_experts": 3                   # Number of experts
+}
 
 LLAMA32_CONFIG_3B = {
     "vocab_size": 128_256,           # Vocabulary size
@@ -105,13 +128,13 @@ def token_ids_to_text(token_ids, tokenizer):
     return tokenizer.decode(flat.tolist())
 
 
-def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=None, eos_id=None):
+def generate(model, idx, expert_map, max_new_tokens, context_size, temperature=0.0, top_k=None, eos_id=None):
 
     # For-loop is the same as before: Get logits, and only focus on last time step
     for _ in range(max_new_tokens):
         idx_cond = idx[:, -context_size:]
         with torch.no_grad():
-            logits = model(idx_cond)
+            logits, _ = model(idx_cond, expert_map)
         logits = logits[:, -1, :]
 
         # Filter logits with top_k sampling
@@ -335,9 +358,13 @@ class GroupedQueryAttention(nn.Module):
 
 
 
-cfg = LLAMA32_CONFIG_3B
+# cfg = LLAMA32_CONFIG_3B
+cfg = LLAMA32_CONFIG_1B
+DEVICE = "cuda:3"
 
-safetensors_path = "/home/jovyan/z_acl/.latent/llama3_3b_local"
+
+# safetensors_path = "/home/jovyan/z_acl/.latent/llama3_3b_local"
+safetensors_path = "/home/jovyan/z_acl/.latent/llama3_1b_local"
 if os.path.isdir(safetensors_path):
     safetensor_files = glob.glob(os.path.join(safetensors_path, "*.safetensors"))
     hf_state_dict = {}
@@ -376,60 +403,159 @@ for l in range(cfg['n_layers']):
 
 
 from transformers import AutoTokenizer
-model_dir = "/home/jovyan/z_acl/.latent/llama3_3b_local"
+
+model = Llama3MoE(cfg)
+model.load_state_dict(new_state_dict)
+model.to(DEVICE)
+
+# model_dir = "/home/jovyan/z_acl/.latent/llama3_3b_local"
+model_dir = "/home/jovyan/z_acl/.latent/llama3_1b_local"
 tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
 tokenizer.pad_token = tokenizer.eos_token
-
-model = Llama3MoE(LLAMA32_CONFIG_3B)
-model.load_state_dict(new_state_dict)
-model.to("cuda:1")
+tokenizer.padding_side = "right"
 
 
-prmopts = [
-    "hey can you prove this theorem?",
-    "write a python function to reverse a string.",
-    "what's 2 raised to the power of 10?",
-    "haha no way"
-]
-
+PROMPT = "Question:\nRob has three chalks and he lost one. How many does he have now? Answer:\n"
 expert_map = torch.tensor([
-    [1, 1, 0],
-    [1, 0, 1],
-    [1, 1, 0],
     [1, 1, 0]
-]).to("cuda:1")
+]).to(DEVICE)
 
-model_inputs = tokenizer(prmopts, padding=True, return_tensors="pt").to("cuda:1")
-
-logits, kl_loss = model(
-    in_idx=model_inputs["input_ids"],
-    expert_map=expert_map
+token_ids = generate(
+    model=model,
+    idx=text_to_token_ids(PROMPT, tokenizer).to(DEVICE),
+    expert_map=expert_map,
+    max_new_tokens=50,
+    context_size=cfg["context_length"],
+    eos_id=tokenizer.pad_token_id
 )
 
-logits.shape, kl_loss
+output_text = token_ids_to_text(token_ids, tokenizer)
+
+print(output_text)
 
 
-# from transformers import AutoTokenizer
-# model_dir = "/home/jovyan/z_acl/.latent/llama3_3b_local"
-# tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+ [markdown]
+# #### Train
 
-# MAX_NEW_TOKENS = 32
-# TEMPERATURE = 0.
-# TOP_K = 1
 
-# PROMPT = 'What do llamas eat?'
-# token_ids = generate(
-#     model=model.to("cuda"),
-#     idx=text_to_token_ids(PROMPT, tokenizer).to("cuda"),
-#     max_new_tokens=MAX_NEW_TOKENS,
-#     context_size=LLAMA32_CONFIG_3B["context_length"],
-#     top_k=TOP_K,
-#     temperature=TEMPERATURE
-# )
+import json
+from torch.utils.data import Dataset, DataLoader
 
-# output_text = token_ids_to_text(token_ids, tokenizer)
 
-# print("Output text:\n\n", output_text)
+class Code_Math_Data(Dataset):
+    def __init__(self, path):
+        with open(path, "r") as f:
+            self.datadict = json.load(f)
+
+    def __len__(self):
+        return len(self.datadict)
+
+    def __getitem__(self, idx):
+        return self.datadict[str(idx)]
 
 
 
+MAX_SEQ_LEN = 512
+NUM_EPOCHS = 1
+BATCH_SIZE = 4
+GRAD_ACCUMULATION_STEPS = 3
+
+dataset = Code_Math_Data("data/merged_data.json")
+dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+optimizer = optim.AdamW(model.parameters(), lr=5e-5)
+# scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
+loss_history = {"nll": [], "kl": [], "total": []}
+
+
+for epoch in range(NUM_EPOCHS):
+    optimizer.zero_grad()
+
+    for step, batch in enumerate(dataloader):
+        model_inputs = tokenizer(
+            batch['question'],
+            padding=True,
+            truncation=True,
+            max_length=MAX_SEQ_LEN,
+            return_tensors="pt"
+        ).to(DEVICE)
+        expert_map = torch.tensor([
+            [1, 1, 0] if t == 'code' else [1, 0, 1]
+            for t in batch['type']
+        ]).to(DEVICE)
+
+        # TODO: revisit this later
+        input_ids = model_inputs['input_ids']
+        pad_token_id = tokenizer.pad_token_id
+        pad_column = torch.full((input_ids.shape[0], 1), pad_token_id, device=input_ids.device, dtype=input_ids.dtype)
+        input_ids = torch.cat([input_ids, pad_column], dim=1)
+
+        seq_indices = torch.arange(input_ids.shape[1]).unsqueeze(0).to(input_ids.device)
+        end_of_text = (input_ids == pad_token_id).int().argmax(dim=1)
+        loss_mask = (seq_indices < (end_of_text).unsqueeze(1)).bfloat16()  # [B, S]
+
+        logits, kl_loss = model(
+            in_idx=input_ids,
+            expert_map=expert_map
+        )
+
+        log_probs = F.log_softmax(logits, dim=-1)  # [B, S, V]
+        targets = input_ids[:, 1:].unsqueeze(-1)   # [B, S-1, 1]
+        token_log_probs = log_probs[:, :-1, :].gather(dim=-1, index=targets).squeeze(-1)  # [B, S-1]
+
+        num_tokens = loss_mask.sum()
+        nll = - (token_log_probs * loss_mask[:, :-1])  # [B, S-1]
+        nll_loss = nll.sum() / num_tokens
+        # model.forward returns per layer total kl-loss, so we divide by `num_tokens` here
+        kl_per_token = kl_loss / num_tokens
+        loss = nll_loss + kl_per_token
+
+        loss_history["nll"].append(nll_loss.item())
+        loss_history["kl"].append(kl_per_token.item())
+        loss_history["total"].append(loss.item())
+
+        loss = loss / GRAD_ACCUMULATION_STEPS
+        loss.backward()
+
+        # step & zero grad every `GRAD_ACCUMULATION_STEPS` steps
+        if (step + 1) % GRAD_ACCUMULATION_STEPS == 0:
+            optimizer.step()
+            optimizer.zero_grad()
+            true_loss = loss.item() * GRAD_ACCUMULATION_STEPS
+            # loss_history.append(true_loss)
+
+        if (step + 1) % 20 == 0:
+            print(f"{nll_loss.item():.6f}", f"{kl_per_token.item():.6f}")
+
+    # catch remaining gradients if dataset size not divisible by accumulation steps
+    if (step + 1) % GRAD_ACCUMULATION_STEPS != 0:
+        optimizer.step()
+        optimizer.zero_grad()
+
+
+
+import matplotlib.pyplot as plt
+plt.plot(loss_history['kl'])
+plt.xlabel("Step")
+plt.ylabel("Loss")
+plt.title("Training Loss")
+plt.show()
+
+
+"""
+TODO:
+1. Proper masking of questions when doing SFT
+    * changes in data?
+    * start mask in loss calc
+
+4. Implement top-k routing
+
+2. Figure out a way to measure expert spec?
+
+3. To have or not have shared expert?
+
+4. Eval on a small set?
+    * create test set for code and math?
+    * nll for code for now?
+
+"""
