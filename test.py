@@ -1,4 +1,7 @@
+import gc
 import os
+import math
+import json
 
 import glob
 from safetensors.torch import load_file
@@ -6,8 +9,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import math
-import gc
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoTokenizer
 
 gc.collect()
 torch.cuda.empty_cache()
@@ -29,26 +32,8 @@ LLAMA32_CONFIG_1B = {
         "high_freq_factor": 4.0,
         "original_context_length": 8192,
     },
-    "n_experts": 3                   # Number of experts
-}
-
-LLAMA32_CONFIG_3B = {
-    "vocab_size": 128_256,           # Vocabulary size
-    "context_length": 131_072,       # Context length that was used to train the model
-    "emb_dim": 3072,                 # Embedding dimension
-    "n_heads": 24,                   # Number of attention heads
-    "n_layers": 28,                  # Number of layers
-    "hidden_dim": 8192,              # Size of the intermediate dimension in FeedForward
-    "n_kv_groups": 8,                # Key-Value groups for grouped-query attention
-    "rope_base": 500_000.0,          # The base in RoPE's "theta"
-    "dtype": torch.bfloat16,         # Lower-precision dtype to reduce memory usage
-    "rope_freq": {                   # RoPE frequency scaling
-        "factor": 32.0,
-        "low_freq_factor": 1.0,
-        "high_freq_factor": 4.0,
-        "original_context_length": 8192,
-    },
-    "n_experts": 3                   # Number of experts
+    "n_experts": 4,                  # Number of experts
+    "top_k": 2                       # Number of active experts
 }
 
 def compute_rope_params(head_dim, theta_base=10_000, context_length=4096, freq_config=None, dtype=torch.float32):
@@ -220,7 +205,6 @@ class TransformerBlock(nn.Module):
             num_kv_groups=cfg["n_kv_groups"],
             dtype=cfg["dtype"]
         )
-        # self.mlp = FeedForward(cfg)
         self.moe = MoE(cfg)
         self.input_layernorm = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
         self.post_attention_layernorm = nn.RMSNorm(cfg["emb_dim"], eps=1e-5, dtype=cfg["dtype"])
@@ -235,7 +219,6 @@ class TransformerBlock(nn.Module):
         # Shortcut connection for feed-forward block
         shortcut = x
         x = self.post_attention_layernorm(x)
-        # x = self.mlp(x)
         x, kl_loss = self.moe(x, expert_map)
         x = x + shortcut  # Add the original input back
 
@@ -261,26 +244,37 @@ class MoE(nn.Module):
         super().__init__()
         self.router = nn.Linear(cfg["emb_dim"], cfg["n_experts"], dtype=cfg["dtype"], bias=False)
         self.experts = nn.ModuleList([ExpertFFN(cfg) for _ in range(cfg["n_experts"])])
+        self.k = cfg["top_k"]
 
     def forward(self, x, expert_map, eps: float = 1e-9):
         b, sl, emb_dim = x.shape
         device = x.device
 
         logits = self.router(x)
-        r = torch.softmax(logits, dim=-1)               # (b, sl, E), fp32
-        outs = [expert(x) for expert in self.experts]   # list of (b, sl, emb_dim)
-        outs = torch.stack(outs, dim=-1)                # (b, sl, emb_dim, E)
-        out = (outs * r.unsqueeze(-2)).sum(dim=-1)      # (b, sl, emb_dim)
+        r = torch.softmax(logits, dim=-1)               # (b, sl, E)
 
-        masked = r * expert_map.unsqueeze(dim=1)
+        # first, let's get the output of top-k routing
+        topk_vals, topk_idx = logits.topk(self.k, dim=-1)   # (b, sl, k)
+        topk_mask = torch.zeros_like(logits, dtype=torch.bool, device=device)
+        topk_mask.scatter_(-1, topk_idx, True)                  # bool mask for top-k
+        masked = r * topk_mask                                  # keep probs for top-k
         denom = masked.sum(dim=-1, keepdim=True).clamp_min(eps)
-        masked_target = masked / denom
-        masked_target = masked_target.detach()  # detach the target so gradients do not flow into it
+        r_topk = masked / denom                            # renormalized top-k (used for forward)
+        outs = [expert(x) for expert in self.experts]      # list of (b, sl, emb_dim)
+        outs = torch.stack(outs, dim=-1)                   # (b, sl, emb_dim, E)
+        out = (outs * r_topk.unsqueeze(-2)).sum(dim=-1) 
+
+        # calc KL-div to minimize later
+        expert_masked = r * expert_map.unsqueeze(dim=1)
+        denom = expert_masked.sum(dim=-1, keepdim=True).clamp_min(eps)
+        expert_masked_target = expert_masked / denom
+        expert_masked_target = expert_masked_target.detach()  # detach the target so gradients do not flow into it
         kl_loss = F.kl_div(
             torch.log(r.clamp_min(eps)),
-            masked_target.clamp_min(eps),
+            expert_masked_target.clamp_min(eps),
             reduction="batchmean"
         )
+
         return out, kl_loss
 
 
@@ -356,8 +350,6 @@ class GroupedQueryAttention(nn.Module):
         return context_vec
 
 
-
-
 # cfg = LLAMA32_CONFIG_3B
 cfg = LLAMA32_CONFIG_1B
 DEVICE = "cuda:3"
@@ -401,9 +393,6 @@ for l in range(cfg['n_layers']):
     )
 
 
-
-from transformers import AutoTokenizer
-
 model = Llama3MoE(cfg)
 model.load_state_dict(new_state_dict)
 model.to(DEVICE)
@@ -413,33 +402,6 @@ model_dir = "/home/jovyan/z_acl/.latent/llama3_1b_local"
 tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
-
-
-PROMPT = "Question:\nRob has three chalks and he lost one. How many does he have now? Answer:\n"
-expert_map = torch.tensor([
-    [1, 1, 0]
-]).to(DEVICE)
-
-token_ids = generate(
-    model=model,
-    idx=text_to_token_ids(PROMPT, tokenizer).to(DEVICE),
-    expert_map=expert_map,
-    max_new_tokens=50,
-    context_size=cfg["context_length"],
-    eos_id=tokenizer.pad_token_id
-)
-
-output_text = token_ids_to_text(token_ids, tokenizer)
-
-print(output_text)
-
-
- [markdown]
-# #### Train
-
-
-import json
-from torch.utils.data import Dataset, DataLoader
 
 
 class Code_Math_Data(Dataset):
@@ -457,8 +419,8 @@ class Code_Math_Data(Dataset):
 
 MAX_SEQ_LEN = 512
 NUM_EPOCHS = 1
-BATCH_SIZE = 4
-GRAD_ACCUMULATION_STEPS = 3
+BATCH_SIZE = 2
+GRAD_ACCUMULATION_STEPS = 8
 
 dataset = Code_Math_Data("data/merged_data.json")
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
@@ -480,30 +442,33 @@ for epoch in range(NUM_EPOCHS):
             return_tensors="pt"
         ).to(DEVICE)
         expert_map = torch.tensor([
-            [1, 1, 0] if t == 'code' else [1, 0, 1]
+            [1, 1, 0, 0] if t == 'code'
+            else [0, 0, 1, 1]
             for t in batch['type']
         ]).to(DEVICE)
 
-        # TODO: revisit this later
         input_ids = model_inputs['input_ids']
         pad_token_id = tokenizer.pad_token_id
         pad_column = torch.full((input_ids.shape[0], 1), pad_token_id, device=input_ids.device, dtype=input_ids.dtype)
         input_ids = torch.cat([input_ids, pad_column], dim=1)
 
         seq_indices = torch.arange(input_ids.shape[1]).unsqueeze(0).to(input_ids.device)
-        end_of_text = (input_ids == pad_token_id).int().argmax(dim=1)
-        loss_mask = (seq_indices < (end_of_text).unsqueeze(1)).bfloat16()  # [B, S]
+        start_token = tokenizer.convert_tokens_to_ids("<|reserved_special_token_0|>")
+        pad_token_id = tokenizer.pad_token_id
+        start = (input_ids == start_token).int().argmax(dim=1)
+        end = (input_ids == pad_token_id).int().argmax(dim=1)
+        loss_mask = (
+            (seq_indices >= (start).unsqueeze(1))
+            & (seq_indices < (end).unsqueeze(1))
+        )  # [B, S]
 
-        logits, kl_loss = model(
-            in_idx=input_ids,
-            expert_map=expert_map
-        )
+        logits, kl_loss = model(in_idx=input_ids, expert_map=expert_map)
 
         log_probs = F.log_softmax(logits, dim=-1)  # [B, S, V]
         targets = input_ids[:, 1:].unsqueeze(-1)   # [B, S-1, 1]
         token_log_probs = log_probs[:, :-1, :].gather(dim=-1, index=targets).squeeze(-1)  # [B, S-1]
 
-        num_tokens = loss_mask.sum()
+        num_tokens = (seq_indices < (end).unsqueeze(1)).sum()
         nll = - (token_log_probs * loss_mask[:, :-1])  # [B, S-1]
         nll_loss = nll.sum() / num_tokens
         # model.forward returns per layer total kl-loss, so we divide by `num_tokens` here
@@ -516,6 +481,7 @@ for epoch in range(NUM_EPOCHS):
 
         loss = loss / GRAD_ACCUMULATION_STEPS
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
         # step & zero grad every `GRAD_ACCUMULATION_STEPS` steps
         if (step + 1) % GRAD_ACCUMULATION_STEPS == 0:
@@ -533,28 +499,42 @@ for epoch in range(NUM_EPOCHS):
         optimizer.zero_grad()
 
 
+with open("moe_sft_logs.txt", "w") as f:
+    json.dump(loss_history, f)
+
 
 import matplotlib.pyplot as plt
+
+with open("moe_sft_logs.txt", "r") as f:
+    loss_history = json.load(f)
+
 plt.plot(loss_history['kl'])
 plt.xlabel("Step")
 plt.ylabel("Loss")
-plt.title("Training Loss")
+plt.title("Training Loss (KL-div)")
+plt.show()
+
+plt.plot(loss_history['total'])
+plt.xlabel("Step")
+plt.ylabel("Loss")
+plt.title("Training Loss (CE)")
 plt.show()
 
 
 """
 TODO:
-1. Proper masking of questions when doing SFT
+1. ✅ Proper masking of questions when doing SFT
     * changes in data?
     * start mask in loss calc
 
-4. Implement top-k routing
+4. ✅ Implement top-k routing
 
 2. Figure out a way to measure expert spec?
 
-3. To have or not have shared expert?
+3. ✅ To have or not have shared expert?
+    -- not to have. let's add 1 more expert and then do 2 way split
 
-4. Eval on a small set?
+4. Eval on a small set? -- just do on gsm8k test set
     * create test set for code and math?
     * nll for code for now?
 
