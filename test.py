@@ -1,16 +1,15 @@
-import gc
+# %%
 import os
-import math
 import json
-
 import glob
 from safetensors.torch import load_file
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer
+import math
+import gc
+from tqdm import trange
 
 gc.collect()
 torch.cuda.empty_cache()
@@ -152,7 +151,7 @@ def generate(model, idx, expert_map, max_new_tokens, context_size, temperature=0
     return idx
 
 
-
+# %%
 class Llama3MoE(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -251,7 +250,7 @@ class MoE(nn.Module):
         device = x.device
 
         logits = self.router(x)
-        r = torch.softmax(logits, dim=-1)               # (b, sl, E)
+        r = torch.softmax(logits, dim=-1)  # (b, sl, E)
 
         # first, let's get the output of top-k routing
         topk_vals, topk_idx = logits.topk(self.k, dim=-1)   # (b, sl, k)
@@ -264,7 +263,7 @@ class MoE(nn.Module):
         outs = torch.stack(outs, dim=-1)                   # (b, sl, emb_dim, E)
         out = (outs * r_topk.unsqueeze(-2)).sum(dim=-1) 
 
-        # calc KL-div to minimize later
+        # calc KL-div to minimize
         expert_masked = r * expert_map.unsqueeze(dim=1)
         denom = expert_masked.sum(dim=-1, keepdim=True).clamp_min(eps)
         expert_masked_target = expert_masked / denom
@@ -350,6 +349,11 @@ class GroupedQueryAttention(nn.Module):
         return context_vec
 
 
+
+# %% [markdown]
+# #### Upcycling
+
+# %%
 # cfg = LLAMA32_CONFIG_3B
 cfg = LLAMA32_CONFIG_1B
 DEVICE = "cuda:3"
@@ -393,15 +397,26 @@ for l in range(cfg['n_layers']):
     )
 
 
+# %%
+from transformers import AutoTokenizer
+
 model = Llama3MoE(cfg)
 model.load_state_dict(new_state_dict)
 model.to(DEVICE)
+print("param count:", sum(p.numel() for p in model.parameters()))
 
 # model_dir = "/home/jovyan/z_acl/.latent/llama3_3b_local"
 model_dir = "/home/jovyan/z_acl/.latent/llama3_1b_local"
 tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = "right"
+
+# %% [markdown]
+# #### Train
+
+# %%
+import json
+from torch.utils.data import Dataset, DataLoader
 
 
 class Code_Math_Data(Dataset):
@@ -413,19 +428,22 @@ class Code_Math_Data(Dataset):
         return len(self.datadict)
 
     def __getitem__(self, idx):
+        if isinstance(idx, slice):
+            indices = range(*idx.indices(len(self)))
+            return [self.datadict[str(i)] for i in indices]
         return self.datadict[str(idx)]
 
-
-
+# %%
 MAX_SEQ_LEN = 512
 NUM_EPOCHS = 1
 BATCH_SIZE = 2
 GRAD_ACCUMULATION_STEPS = 8
+LEARING_RATE = 5e-5
 
-dataset = Code_Math_Data("data/merged_data.json")
+dataset = Code_Math_Data("data/train.json")
 dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-optimizer = optim.AdamW(model.parameters(), lr=5e-5)
+optimizer = optim.AdamW(model.parameters(), lr=LEARING_RATE)
 # scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
 loss_history = {"nll": [], "kl": [], "total": []}
 
@@ -442,7 +460,7 @@ for epoch in range(NUM_EPOCHS):
             return_tensors="pt"
         ).to(DEVICE)
         expert_map = torch.tensor([
-            [1, 1, 0, 0] if t == 'code'
+            [1, 1, 0, 0] if t == 'math'
             else [0, 0, 1, 1]
             for t in batch['type']
         ]).to(DEVICE)
@@ -488,7 +506,6 @@ for epoch in range(NUM_EPOCHS):
             optimizer.step()
             optimizer.zero_grad()
             true_loss = loss.item() * GRAD_ACCUMULATION_STEPS
-            # loss_history.append(true_loss)
 
         if (step + 1) % 20 == 0:
             print(f"{nll_loss.item():.6f}", f"{kl_per_token.item():.6f}")
@@ -502,7 +519,10 @@ for epoch in range(NUM_EPOCHS):
 with open("moe_sft_logs.txt", "w") as f:
     json.dump(loss_history, f)
 
+PATH = "llama3_1b_moe/model.pth"
+torch.save(model.state_dict(), PATH)
 
+# %%
 import matplotlib.pyplot as plt
 
 with open("moe_sft_logs.txt", "r") as f:
@@ -517,10 +537,10 @@ plt.show()
 plt.plot(loss_history['total'])
 plt.xlabel("Step")
 plt.ylabel("Loss")
-plt.title("Training Loss (CE)")
+plt.title("Training Loss (CE + KL-div)")
 plt.show()
 
-
+# %%
 """
 TODO:
 1. ✅ Proper masking of questions when doing SFT
@@ -529,13 +549,664 @@ TODO:
 
 4. ✅ Implement top-k routing
 
-2. Figure out a way to measure expert spec?
-
 3. ✅ To have or not have shared expert?
     -- not to have. let's add 1 more expert and then do 2 way split
 
-4. Eval on a small set? -- just do on gsm8k test set
+4. ✅ Eval on a small set? -- just do on gsm8k test set
     * create test set for code and math?
     * nll for code for now?
 
+2. ✅ Figure out a way to measure expert spec? -- read some
+
+5. May be train with higher lr
+    -- kinda terrible. need to see if 'experts' work or not
+
+6. ✅ may be instad of code, do something else, like
+    - science MCQ or medical data?
+    - easier to show perf comparison b/w base and sft
 """
+
+# %% [markdown]
+# #### Eval
+
+# %%
+dataset = Code_Math_Data("data/test.json")
+
+math_acc = 0
+medical_acc = 0
+
+for i in range(len(dataset)):
+    data = dataset[i]
+    prompt = data['question']
+    expert_map = torch.tensor([
+        [1, 1, 0, 0] 
+        if data['type'] == 'math'
+        else [0, 0, 1, 1]
+    ]).to(DEVICE)
+
+    token_ids = generate(
+        model=model,
+        idx=text_to_token_ids(prompt, tokenizer).to(DEVICE),
+        expert_map=expert_map,
+        max_new_tokens=500,
+        context_size=cfg["context_length"],
+        eos_id=tokenizer.pad_token_id,
+        temperature=0.0
+    )
+
+    output_text = token_ids_to_text(token_ids, tokenizer)
+
+    if data['type'] == 'math':
+        try:
+            gen_answer = float(output_text.split("#####")[1])
+        except Exception:
+            gen_answer = float('inf')
+        actual_answer = float(data['answer'].split("#####")[1])
+        if gen_answer == actual_answer:
+            math_acc += 1 
+    else:
+        gen_answer = output_text[-1]
+        actual_answer = data['answer']
+        if gen_answer == actual_answer:
+            medical_acc += 1
+
+print(f"Math: {math_acc} / {len(dataset) // 2} ({math_acc / (len(dataset) // 2)})")
+print(f"Medical: {medical_acc} / {len(dataset) // 2} ({medical_acc / (len(dataset) // 2)})")
+
+# %%
+# MoE - GSM8K Test Set
+
+from datasets import load_dataset
+dataset = load_dataset("openai/gsm8k", 'main')
+
+math_acc = 0
+for i in range(len(dataset['test'])):
+    try:
+        data = dataset['test'][i]
+        expert_map = torch.tensor([
+            [1, 1, 0, 0] 
+            # if data['type'] == 'math'
+            # else [0, 0, 1, 1]
+        ]).to(DEVICE)
+
+        question = (
+            f"Question:\n{data['question']}\n"
+            + f"Answer:\n"
+            + "<|reserved_special_token_0|>"
+        )
+        actual_answer = float(data['answer'].split("####")[1].replace(",", ""))
+
+        token_ids = generate(
+                model=model,
+                idx=text_to_token_ids(question, tokenizer).to(DEVICE),
+                expert_map=expert_map,
+                max_new_tokens=500,
+                context_size=cfg["context_length"],
+                eos_id=tokenizer.pad_token_id,
+                temperature=0.0
+            )
+
+        output_text = token_ids_to_text(token_ids, tokenizer)
+        try:
+            gen_answer = float(output_text.split("#####")[1])
+        except Exception:
+            gen_answer = float('inf')
+
+        if gen_answer == actual_answer:
+            math_acc += 1
+
+    except Exception as e:
+        print(e)
+
+print(f"GSM8k test: {math_acc} / {len(dataset['test'])} ({math_acc / len(dataset['test'])})")
+
+# %% [markdown]
+# #### Work
+
+# %%
+PROMPT = "Question:\nAdam has $500 in his account. He spends 3 dollars every time he rides a bus and he takes the bus 5 times a week. How much money, in dollars, will be left in his account after a month, assuming a month has 4 weeks?\nAnswer:\n<|reserved_special_token_0|>"
+
+expert_map = torch.tensor([
+    [0, 0, 1, 1]
+    # [1, 1, 0, 0]
+]).to(DEVICE)
+
+token_ids = generate(
+    model=model,
+    idx=text_to_token_ids(PROMPT, tokenizer).to(DEVICE),
+    expert_map=expert_map,
+    max_new_tokens=150,
+    context_size=cfg["context_length"],
+    eos_id=tokenizer.pad_token_id,
+    temperature=0.4
+)
+
+output_text = token_ids_to_text(token_ids, tokenizer)
+
+print(output_text)
+
+
+# %%
+model.layers[11].moe#.router.weight
+model.layers[11].moe.experts[0].fc1.weight, model.layers[11].moe.experts[3].fc1.weight
+
+# %%
+
+
+# %% [markdown]
+# #### Eval Real
+
+# %% [markdown]
+# ##### Eval Base
+
+# %%
+import json
+import random
+import numpy as np
+
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+MODEL_NAME = "/home/jovyan/z_acl/.latent/llama3_1b_local"
+DEVICE = "cuda:3"
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, torch_dtype="auto")
+model.to(DEVICE)
+
+from datasets import load_dataset
+dataset = load_dataset("openai/gsm8k", 'main')
+
+
+def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=None, eos_id=None):
+
+    # For-loop is the same as before: Get logits, and only focus on last time step
+    for _ in range(max_new_tokens):
+        idx_cond = idx[:, -context_size:]
+        with torch.no_grad():
+            logits = model(idx_cond).logits
+        logits = logits[:, -1, :]
+
+        # Filter logits with top_k sampling
+        if top_k is not None:
+            # Keep only top_k values
+            top_logits, _ = torch.topk(logits, top_k)
+            min_val = top_logits[:, -1]
+            logits = torch.where(logits < min_val, torch.tensor(float('-inf')).to(logits.device), logits)
+
+        # Apply temperature scaling
+        if temperature > 0.0:
+            logits = logits / temperature
+
+            # Apply softmax to get probabilities
+            probs = torch.softmax(logits, dim=-1)  # (batch_size, context_len)
+
+            # Sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)  # (batch_size, 1)
+
+        # Otherwise same as before: get idx of the vocab entry with the highest logits value
+        else:
+            idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (batch_size, 1)
+
+        if idx_next == eos_id:  # Stop generating early if end-of-sequence token is encountered and eos_id is specified
+            break
+
+        # Same as before: append sampled index to the running sequence
+        idx = torch.cat((idx, idx_next), dim=1)  # (batch_size, num_tokens+1)
+
+    return idx
+
+np.random.seed(42)
+random.seed(42)
+
+with open("data/train.json") as f:
+    train_data = json.load(f)
+
+valid_indices = [i for i in train_data if train_data[i]['type'] == "math"]
+ids = np.random.choice(valid_indices, size=8, replace=False).tolist()
+few_shot = ("\n".join([train_data[i]['question']+'<|eot_id|>' for i in ids]))
+
+print(few_shot)
+
+# %%
+# base - aug-nl
+
+from tqdm import trange
+with open("data/test.json", "r") as f:
+    test_data = json.load(f)
+
+# test_data = {k: test_data[k] for k in test_data if test_data[k]['type'] == 'math'}
+indices = [k for k in test_data if test_data[k]['type'] == 'math']
+
+math_acc = 0
+# count = 0
+
+for j in trange(len(indices)):
+    i = indices[j]
+    try:
+        data = test_data[i]
+        expert_map = torch.tensor([
+            [1, 1, 0, 0] 
+            # if data['type'] == 'math'
+            # else [0, 0, 1, 1]
+        ]).to(DEVICE)
+
+        question = (
+            few_shot
+            + f"\nQuestion:\n{data['question']}\n"
+            + f"Answer:\n"
+            + "<|reserved_special_token_0|>"
+        )
+        actual_answer = float(data['answer'].split("#####")[1])
+
+        token_ids = generate(
+            model=model,
+            idx=text_to_token_ids(question, tokenizer).to(DEVICE),
+            max_new_tokens=200,
+            context_size=LLAMA32_CONFIG_1B["context_length"],
+            eos_id=tokenizer.convert_tokens_to_ids('<|eot_id|>'),
+            temperature=0.0
+        )
+
+        output_text = token_ids_to_text(token_ids, tokenizer)
+        try:
+            gen_answer = float(output_text.split("#####")[-1])
+        except Exception:
+            gen_answer = float('inf')
+
+        if gen_answer == actual_answer:
+            math_acc += 1
+
+    except Exception as e:
+        print(e)
+
+    # count += 1
+    # if count == 20:
+    #     break
+
+# print(f"{math_acc} / {count}")
+
+print(f"GSM8k-Aug NL test: {math_acc} / {(len(test_data) // 2)} ({math_acc / (len(test_data) // 2)})")
+
+# %%
+# base gsm-8k
+
+math_acc = 0
+count = 0
+
+for i in range(len(dataset['test'])):
+    count += 1
+    try:
+        data = dataset['test'][i]
+        expert_map = torch.tensor([
+            [1, 1, 0, 0] 
+            # if data['type'] == 'math'
+            # else [0, 0, 1, 1]
+        ]).to(DEVICE)
+
+        question = (
+            few_shot
+            + f"\nQuestion:\n{data['question']}\n"
+            + f"Answer:\n"
+            + "<|reserved_special_token_0|>"
+        )
+        actual_answer = float(data['answer'].split("####")[1].replace(",", ""))
+
+        token_ids = generate(
+                model=model,
+                idx=text_to_token_ids(question, tokenizer).to(DEVICE),
+                max_new_tokens=200,
+                context_size=LLAMA32_CONFIG_1B["context_length"],
+                eos_id=tokenizer.convert_tokens_to_ids('<|eot_id|>'),
+                temperature=0.0
+            )
+
+        output_text = token_ids_to_text(token_ids, tokenizer)
+        try:
+            gen_answer = float(output_text.split("#####")[-1])
+        except Exception:
+            gen_answer = float('inf')
+
+        if gen_answer == actual_answer:
+            math_acc += 1
+
+    except Exception as e:
+        print(e)
+
+    if count == 100:
+        break
+
+print(f"{math_acc} / {count}")
+# print(f"GSM8k test: {math_acc} / {len(dataset['test'])} ({math_acc / len(dataset['test'])})")
+
+# %% [markdown]
+# ##### Eval MoE - AUG-NL
+
+# %%
+import json
+import random
+import numpy as np
+
+np.random.seed(42)
+random.seed(42)
+
+with open("data/train.json") as f:
+    train_data = json.load(f)
+
+valid_indices = [i for i in train_data if train_data[i]['type'] == "math"]
+ids = np.random.choice(valid_indices, size=8, replace=False).tolist()
+few_shot = ("\n".join([train_data[i]['question']+'<|eot_id|>' for i in ids]))
+
+# print(few_shot)
+
+# %%
+# base - aug-nl
+
+from tqdm import trange
+with open("data/test.json", "r") as f:
+    test_data = json.load(f)
+
+# test_data = {k: test_data[k] for k in test_data if test_data[k]['type'] == 'math'}
+indices = [k for k in test_data if test_data[k]['type'] == 'math']
+
+math_acc = 0
+# count = 0
+
+for j in trange(len(indices)):
+    i = indices[j]
+    try:
+        data = test_data[i]
+
+        question = (
+            few_shot
+            + f"\n{data['question']}"
+        )
+        actual_answer = float(data['answer'].split("#####")[1])
+
+        expert_map = torch.tensor([
+            [1, 1, 0, 0] 
+            # if data['type'] == 'math'
+            # else [0, 0, 1, 1]
+        ]).to(DEVICE)
+
+        token_ids = generate(
+            model=model,
+            idx=text_to_token_ids(question, tokenizer).to(DEVICE),
+            expert_map=expert_map,
+            max_new_tokens=500,
+            context_size=cfg["context_length"],
+            eos_id=tokenizer.pad_token_id,
+            temperature=0.0
+        )
+
+        output_text = token_ids_to_text(token_ids, tokenizer)
+        try:
+            gen_answer = float(output_text.split("#####")[-1])
+        except Exception:
+            gen_answer = float('inf')
+
+        if gen_answer == actual_answer:
+            math_acc += 1
+
+    except Exception as e:
+        print(e)
+
+    # count += 1
+    # if count == 100:
+    #     break
+
+print(f"MoE GSM8k-Aug NL test: {math_acc} / {(len(test_data) // 2)} ({math_acc / (len(test_data) // 2)})")
+
+# %% [markdown]
+# ##### Eval MoE - GSM OG TEST
+
+# %%
+import json
+import random
+import numpy as np
+from datasets import load_dataset
+from tqdm import trange
+
+np.random.seed(42)
+random.seed(42)
+
+with open("data/train.json") as f:
+    train_data = json.load(f)
+
+valid_indices = [i for i in train_data if train_data[i]['type'] == "math"]
+ids = np.random.choice(valid_indices, size=8, replace=False).tolist()
+few_shot = ("\n".join([train_data[i]['question']+'<|eot_id|>' for i in ids]))
+
+dataset = load_dataset("openai/gsm8k", 'main')
+
+# %%
+# base gsm-8k
+
+math_acc = 0
+count = 0
+
+for i in trange(len(dataset['test'])):
+    try:
+        data = dataset['test'][i]
+        question = (
+            few_shot
+            + f"\nQuestion:\n{data['question']}\n"
+            + f"Answer:\n"
+            + "<|reserved_special_token_0|>"
+        )
+        actual_answer = float(data['answer'].split("####")[1].replace(",", ""))
+        expert_map = torch.tensor([
+            [1, 1, 0, 0] 
+            # if data['type'] == 'math'
+            # else [0, 0, 1, 1]
+        ]).to(DEVICE)
+
+        token_ids = generate(
+            model=model,
+            idx=text_to_token_ids(question, tokenizer).to(DEVICE),
+            expert_map=expert_map,
+            max_new_tokens=500,
+            context_size=cfg["context_length"],
+            eos_id=tokenizer.pad_token_id,
+            temperature=0.0
+        )
+
+        output_text = token_ids_to_text(token_ids, tokenizer)
+        try:
+            gen_answer = float(output_text.split("#####")[-1])
+        except Exception:
+            gen_answer = float('inf')
+
+        if gen_answer == actual_answer:
+            math_acc += 1
+
+    except Exception as e:
+        print(e)
+
+    count += 1
+    # if count == 10:
+    #     break
+    if count % 50 == 0:
+        print(math_acc / count)
+
+# print(f"{math_acc} / {count}")
+print(f"MoE GSM8k test: {math_acc} / {len(dataset['test'])} ({math_acc / len(dataset['test'])})")
+
+# %% [markdown]
+# #### Eval - Medical
+
+# %%
+import json
+import random
+import numpy as np
+from datasets import load_dataset
+from tqdm import trange
+
+np.random.seed(42)
+random.seed(42)
+
+with open("data/train.json") as f:
+    train_data = json.load(f)
+
+valid_indices = [i for i in train_data if train_data[i]['type'] != "math"]
+ids = np.random.choice(valid_indices, size=8, replace=False).tolist()
+few_shot = ("\n".join([train_data[i]['question']+'<|eot_id|>' for i in ids]))
+
+# %%
+# MoE - medical
+
+from tqdm import trange
+with open("data/test.json", "r") as f:
+    test_data = json.load(f)
+
+# test_data = {k: test_data[k] for k in test_data if test_data[k]['type'] == 'math'}
+indices = [k for k in test_data if test_data[k]['type'] != 'math']
+
+medical_acc = 0
+count = 0
+
+for j in trange(len(indices)):
+    i = indices[j]
+    try:
+        data = test_data[i]
+
+        question = (
+            few_shot
+            + f"\n{data['question']}"
+        )
+        actual_answer = data['answer']
+
+        expert_map = torch.tensor([
+            # [1, 1, 0, 0] 
+            # if data['type'] == 'math'
+            # else [0, 0, 1, 1]
+            [0, 0, 1, 1]
+        ]).to(DEVICE)
+
+        token_ids = generate(
+            model=model,
+            idx=text_to_token_ids(question, tokenizer).to(DEVICE),
+            expert_map=expert_map,
+            max_new_tokens=500,
+            context_size=cfg["context_length"],
+            eos_id=tokenizer.pad_token_id,
+            temperature=0.0
+        )
+
+        output_text = token_ids_to_text(token_ids, tokenizer)
+        try:
+            gen_answer = output_text[-1]
+        except Exception:
+            gen_answer = float('inf')
+
+        if gen_answer == actual_answer:
+            medical_acc += 1
+
+    except Exception as e:
+        print(e)
+
+    # count += 1
+    # if count == 20:
+    #     break
+
+print(f"MoE Medical test: {medical_acc} / {(len(test_data) // 2)} ({medical_acc / (len(test_data) // 2)})")
+
+# %%
+# base - medical
+
+
+def generate(model, idx, max_new_tokens, context_size, temperature=0.0, top_k=None, eos_id=None):
+
+    # For-loop is the same as before: Get logits, and only focus on last time step
+    for _ in range(max_new_tokens):
+        idx_cond = idx[:, -context_size:]
+        with torch.no_grad():
+            logits = model(idx_cond).logits
+        logits = logits[:, -1, :]
+
+        # Filter logits with top_k sampling
+        if top_k is not None:
+            # Keep only top_k values
+            top_logits, _ = torch.topk(logits, top_k)
+            min_val = top_logits[:, -1]
+            logits = torch.where(logits < min_val, torch.tensor(float('-inf')).to(logits.device), logits)
+
+        # Apply temperature scaling
+        if temperature > 0.0:
+            logits = logits / temperature
+
+            # Apply softmax to get probabilities
+            probs = torch.softmax(logits, dim=-1)  # (batch_size, context_len)
+
+            # Sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)  # (batch_size, 1)
+
+        # Otherwise same as before: get idx of the vocab entry with the highest logits value
+        else:
+            idx_next = torch.argmax(logits, dim=-1, keepdim=True)  # (batch_size, 1)
+
+        if idx_next == eos_id:  # Stop generating early if end-of-sequence token is encountered and eos_id is specified
+            break
+
+        # Same as before: append sampled index to the running sequence
+        idx = torch.cat((idx, idx_next), dim=1)  # (batch_size, num_tokens+1)
+
+    return idx
+
+
+from tqdm import trange
+with open("data/test.json", "r") as f:
+    test_data = json.load(f)
+
+# test_data = {k: test_data[k] for k in test_data if test_data[k]['type'] == 'math'}
+indices = [k for k in test_data if test_data[k]['type'] != 'math']
+
+medical_acc = 0
+count = 0
+
+for j in trange(len(indices)):
+    i = indices[j]
+    try:
+        data = test_data[i]
+
+        question = (
+            few_shot
+            + f"\n{data['question']}"
+        )
+        actual_answer = data['answer']
+
+        expert_map = torch.tensor([
+            # [1, 1, 0, 0] 
+            # if data['type'] == 'math'
+            # else [0, 0, 1, 1]
+            [0, 0, 1, 1]
+        ]).to(DEVICE)
+
+        token_ids = generate(
+            model=model,
+            idx=text_to_token_ids(question, tokenizer).to(DEVICE),
+            # expert_map=expert_map,
+            max_new_tokens=1,
+            context_size=LLAMA32_CONFIG_1B["context_length"],
+            eos_id=tokenizer.pad_token_id,
+            temperature=0.0
+        )
+
+        output_text = token_ids_to_text(token_ids, tokenizer)
+        try:
+            gen_answer = output_text[-1]
+        except Exception:
+            gen_answer = float('inf')
+
+        if gen_answer == actual_answer:
+            medical_acc += 1
+
+    except Exception as e:
+        print(e)
+
+    # count += 1
+    # if count == 20:
+    #     break
+
+print(f"Base Medical test: {medical_acc} / {(len(test_data) // 2)} ({medical_acc / (len(test_data) // 2)})")
+
+
