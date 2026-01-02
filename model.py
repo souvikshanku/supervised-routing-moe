@@ -23,7 +23,7 @@ LLAMA32_CONFIG_1B = {
         "high_freq_factor": 4.0,
         "original_context_length": 8192,
     },
-    "n_experts": 4,                  # Number of experts
+    "n_experts": 6,                  # Number of experts
     "top_k": 2                       # Number of active experts
 }
 
@@ -145,7 +145,7 @@ def generate(model, idx, expert_map, max_new_tokens, context_size, temperature=0
 
 
 class Llama3MoE(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg, tokenizer):
         super().__init__()
 
         # Main model parameters
@@ -168,18 +168,18 @@ class Llama3MoE(nn.Module):
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
         self.cfg = cfg
+        self.tokenizer = tokenizer
 
-    def forward(self, in_idx, expert_map, tokenizer=None):
-        if tokenizer:
-            seq_indices = torch.arange(in_idx.shape[1]).unsqueeze(0).to(in_idx.device)
-            start_token = tokenizer.convert_tokens_to_ids("<|reserved_special_token_0|>")
-            pad_token_id = tokenizer.pad_token_id
-            start = (in_idx == start_token).int().argmax(dim=1)
-            end = (in_idx == pad_token_id).int().argmax(dim=1)
-            loss_mask = (
-                (seq_indices >= (start).unsqueeze(1))
-                & (seq_indices < (end).unsqueeze(1))
-            )  # [B, S]
+    def forward(self, in_idx, expert_map):
+        seq_indices = torch.arange(in_idx.shape[1]).unsqueeze(0).to(in_idx.device)
+        start_token = self.tokenizer.convert_tokens_to_ids("<|reserved_special_token_0|>")
+        pad_token_id = self.tokenizer.pad_token_id
+        start = (in_idx == start_token).int().argmax(dim=1)
+        end = (in_idx == pad_token_id).int().argmax(dim=1)
+        loss_mask = (
+            (seq_indices >= (start).unsqueeze(1))
+            & (seq_indices < (end).unsqueeze(1))
+        )  # [B, S]
 
         tok_embeds = self.embed_tokens(in_idx)
         x = tok_embeds

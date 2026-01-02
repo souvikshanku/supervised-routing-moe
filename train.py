@@ -1,4 +1,3 @@
-import gc
 import os
 import json
 import math
@@ -8,7 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from tqdm import trange
 from transformers import AutoTokenizer
 from safetensors.torch import load_file
 from torch.utils.data import Dataset, DataLoader
@@ -71,17 +69,14 @@ if __name__ == "__main__":
             new_state_dict[f"layers.{l}.mlp.down_proj.weight"]
         )
 
-
-    model = Llama3MoE(cfg)
-    model.load_state_dict(new_state_dict)
-    model.to(DEVICE)
-    # print("param count:", sum(p.numel() for p in model.parameters()))
-
-    # model_dir = "/home/jovyan/z_acl/.latent/llama3_3b_local"
-    model_dir = "/home/jovyan/z_acl/.latent/llama3_1b_local"
+    model_dir = "llama3_1b_local"
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
+
+    model = Llama3MoE(cfg, tokenizer)
+    model.load_state_dict(new_state_dict)
+    model.to(DEVICE)
 
     # Freeze everything
     for p in model.parameters():
@@ -101,6 +96,12 @@ if __name__ == "__main__":
     BATCH_SIZE = 4
     GRAD_ACCUMULATION_STEPS = 8
     LEARING_RATE = 5e-4
+    ROUTER_ONLY_TRAINING = True
+    EXPERT_MAPS = {
+        'math':    [1, 1, 0, 0, 0, 0],
+        'code':    [0, 0, 1, 1, 0, 0],
+        'medical': [0, 0, 0, 0, 1, 1],
+    }
 
     dataset = Code_Math_Data("data/train.json")
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
@@ -109,7 +110,7 @@ if __name__ == "__main__":
     optimizer = optim.AdamW(router_params, lr=LEARING_RATE)
     # optimizer = optim.AdamW(model.parameters(), lr=LEARING_RATE)
     # scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99)
-    loss_history = {"nll": [], "total": []}
+    loss_history = {"nll_loss": [], "expert_loss": [], "total": []}
 
     model.train()
 
@@ -124,37 +125,38 @@ if __name__ == "__main__":
                 max_length=MAX_SEQ_LEN,
                 return_tensors="pt"
             ).to(DEVICE)
-            expert_map = torch.tensor([
-                [1, 1, 0, 0] if t == 'math'
-                else [0, 0, 1, 1]
-                for t in batch['type']
-            ]).to(DEVICE)
+
+            expert_map = torch.tensor([EXPERT_MAPS[t] for t in batch['type']]).to(DEVICE)
 
             input_ids = model_inputs['input_ids']
             pad_token_id = tokenizer.pad_token_id
             pad_column = torch.full((input_ids.shape[0], 1), pad_token_id, device=input_ids.device, dtype=input_ids.dtype)
             input_ids = torch.cat([input_ids, pad_column], dim=1)
 
-            logits, expert_loss = model(in_idx=input_ids, expert_map=expert_map, tokenizer=tokenizer)
+            logits, expert_loss = model(in_idx=input_ids, expert_map=expert_map)
+            nll_loss = 0
 
-            # seq_indices = torch.arange(input_ids.shape[1]).unsqueeze(0).to(input_ids.device)
-            # start_token = tokenizer.convert_tokens_to_ids("<|reserved_special_token_0|>")
-            # pad_token_id = tokenizer.pad_token_id
-            # start = (input_ids == start_token).int().argmax(dim=1)
-            # end = (input_ids == pad_token_id).int().argmax(dim=1)
-            # loss_mask = (
-            #     (seq_indices >= (start).unsqueeze(1))
-            #     & (seq_indices < (end).unsqueeze(1))
-            # )  # [B, S]
-            # log_probs = F.log_softmax(logits, dim=-1)  # [B, S, V]
-            # targets = input_ids[:, 1:].unsqueeze(-1)   # [B, S-1, 1]
-            # token_log_probs = log_probs[:, :-1, :].gather(dim=-1, index=targets).squeeze(-1)  # [B, S-1]
-            # num_tokens = (seq_indices < (end).unsqueeze(1)).sum()
-            # nll = - (token_log_probs * loss_mask[:, :-1])  # [B, S-1]
-            # nll_loss = nll.sum() / num_tokens
+            if not ROUTER_ONLY_TRAINING:
+                seq_indices = torch.arange(input_ids.shape[1]).unsqueeze(0).to(input_ids.device)
+                start_token = tokenizer.convert_tokens_to_ids("<|reserved_special_token_0|>")
+                pad_token_id = tokenizer.pad_token_id
+                start = (input_ids == start_token).int().argmax(dim=1)
+                end = (input_ids == pad_token_id).int().argmax(dim=1)
+                loss_mask = (
+                    (seq_indices >= (start).unsqueeze(1))
+                    & (seq_indices < (end).unsqueeze(1))
+                )  # [B, S]
+                log_probs = F.log_softmax(logits, dim=-1)  # [B, S, V]
+                targets = input_ids[:, 1:].unsqueeze(-1)   # [B, S-1, 1]
+                token_log_probs = log_probs[:, :-1, :].gather(dim=-1, index=targets).squeeze(-1)  # [B, S-1]
+                num_tokens = (seq_indices < (end).unsqueeze(1)).sum()
+                nll = - (token_log_probs * loss_mask[:, :-1])  # [B, S-1]
+                nll_loss = nll.sum() / num_tokens
 
-            loss = expert_loss
+            loss = nll_loss + expert_loss
 
+            loss_history["nll_loss"].append(nll_loss if isinstance(nll_loss, int) else nll_loss.item())
+            loss_history["expert_loss"].append(expert_loss.item())
             loss_history["total"].append(loss.item())
 
             loss = loss / GRAD_ACCUMULATION_STEPS
@@ -162,9 +164,9 @@ if __name__ == "__main__":
 
             # step & zero grad every `GRAD_ACCUMULATION_STEPS` steps
             if (step + 1) % GRAD_ACCUMULATION_STEPS == 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
                 optimizer.zero_grad()
-                true_loss = loss.item() * GRAD_ACCUMULATION_STEPS
 
             if (step + 1) % 20 == 0:
                 print(loss.item())
@@ -180,3 +182,4 @@ if __name__ == "__main__":
 
     PATH = "llama3_1b_moe/model.pth"
     torch.save(model.state_dict(), PATH)
+    print("model saved at ", PATH)
